@@ -12,8 +12,7 @@ using namespace std;
 
 class EventDispatcher {
 public:
-  EventDispatcher() {
-  }
+  EventDispatcher() {}
 
   void wait_event(DataSink *sink) {
     unique_lock<mutex> lk(m_);
@@ -64,6 +63,10 @@ int main(void) {
 
   Server svr;
 
+  svr.new_task_queue = [] {
+    return new ThreadPool(/*num_threads=*/128, /*max_queued_requests=*/256);
+  };
+
   svr.Get("/", [&](const Request & /*req*/, Response &res) {
     res.set_content(html, "text/html");
   });
@@ -90,8 +93,8 @@ int main(void) {
     int id = 0;
     while (true) {
       this_thread::sleep_for(chrono::seconds(1));
-      cout << "send event: " << id << std::endl;
-      std::stringstream ss;
+      cout << "send event: " << id << endl;
+      stringstream ss;
       ss << "data: " << id << "\n\n";
       ed.send_event(ss.str());
       id++;
