@@ -169,11 +169,11 @@ using ssize_t = long;
 #endif // _MSC_VER
 
 #ifndef S_ISREG
-#define S_ISREG(m) (((m) & S_IFREG) == S_IFREG)
+#define S_ISREG(m) (((m)&S_IFREG) == S_IFREG)
 #endif // S_ISREG
 
 #ifndef S_ISDIR
-#define S_ISDIR(m) (((m) & S_IFDIR) == S_IFDIR)
+#define S_ISDIR(m) (((m)&S_IFDIR) == S_IFDIR)
 #endif // S_ISDIR
 
 #ifndef NOMINMAX
@@ -612,7 +612,6 @@ using Ranges = std::vector<Range>;
 struct Request {
   std::string method;
   std::string path;
-  Params params;
   Headers headers;
   std::string body;
 
@@ -624,6 +623,7 @@ struct Request {
   // for server
   std::string version;
   std::string target;
+  Params params;
   MultipartFormDataMap files;
   Ranges ranges;
   Match matches;
@@ -1582,9 +1582,6 @@ private:
   bool send_(Request &req, Response &res, Error &error);
   Result send_(Request &&req);
 
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-  bool is_ssl_peer_could_be_closed(SSL *ssl) const;
-#endif
   socket_t create_client_socket(Error &error) const;
   bool read_response_line(Stream &strm, const Request &req,
                           Response &res) const;
@@ -2271,7 +2268,7 @@ inline std::wstring u8string_to_wstring(const char *s) {
     wlen = ::MultiByteToWideChar(
         CP_UTF8, 0, s, len,
         const_cast<LPWSTR>(reinterpret_cast<LPCWSTR>(ws.data())), wlen);
-    if (wlen != static_cast<int>(ws.size())) { ws.clear(); }
+    if (wlen != ws.size()) { ws.clear(); }
   }
   return ws;
 }
@@ -3308,6 +3305,8 @@ inline bool keep_alive(const std::atomic<socket_t> &svr_sock, socket_t sock,
     } else {
       return true; // Ready for read
     }
+
+    std::this_thread::sleep_for(microseconds{interval_usec});
   }
 
   return false;
@@ -3322,8 +3321,8 @@ process_server_socket_core(const std::atomic<socket_t> &svr_sock, socket_t sock,
   auto ret = false;
   auto count = keep_alive_max_count;
   while (count > 0 && keep_alive(svr_sock, sock, keep_alive_timeout_sec)) {
-    auto close_connection = count == 1;
-    auto connection_closed = false;
+    bool close_connection = count == 1;
+    bool connection_closed = false;
     ret = callback(close_connection, connection_closed);
     if (!ret || connection_closed) { break; }
     count--;
@@ -3525,7 +3524,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
     if (socket_options) { socket_options(sock); }
 
     // bind or connect
-    auto quit = false;
+    bool quit = false;
     if (bind_or_connect(sock, *rp, quit)) { return sock; }
 
     close_socket(sock);
@@ -7416,14 +7415,6 @@ inline bool ClientImpl::send(Request &req, Response &res, Error &error) {
   return ret;
 }
 
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-inline bool ClientImpl::is_ssl_peer_could_be_closed(SSL *ssl) const {
-  char buf[1];
-  return !SSL_peek(ssl, buf, 1) &&
-         SSL_get_error(ssl, 0) == SSL_ERROR_ZERO_RETURN;
-}
-#endif
-
 inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
   {
     std::lock_guard<std::mutex> guard(socket_mutex_);
@@ -7435,13 +7426,6 @@ inline bool ClientImpl::send_(Request &req, Response &res, Error &error) {
     auto is_alive = false;
     if (socket_.is_open()) {
       is_alive = detail::is_socket_alive(socket_.sock);
-
-#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-      if (is_alive && is_ssl()) {
-        if (is_ssl_peer_could_be_closed(socket_.ssl)) { is_alive = false; }
-      }
-#endif
-
       if (!is_alive) {
         // Attempt to avoid sigpipe by shutting down nongracefully if it seems
         // like the other side has already closed the connection Also, there
@@ -7797,13 +7781,7 @@ inline bool ClientImpl::write_request(Stream &strm, Request &req,
   {
     detail::BufferStream bstrm;
 
-    const auto &path_with_query =
-        req.params.empty() ? req.path
-                           : append_query_params(req.path, req.params);
-
-    const auto &path =
-        url_encode_ ? detail::encode_url(path_with_query) : path_with_query;
-
+    const auto &path = url_encode_ ? detail::encode_url(req.path) : req.path;
     detail::write_request_line(bstrm, req.method, path);
 
     header_writer_(bstrm, req.headers);
@@ -7944,7 +7922,9 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
   if (is_ssl()) {
     auto is_proxy_enabled = !proxy_host_.empty() && proxy_port_ != -1;
     if (!is_proxy_enabled) {
-      if (is_ssl_peer_could_be_closed(socket_.ssl)) {
+      char buf[1];
+      if (SSL_peek(socket_.ssl, buf, 1) == 0 &&
+          SSL_get_error(socket_.ssl, 0) == SSL_ERROR_ZERO_RETURN) {
         error = Error::SSLPeerCouldBeClosed_;
         return false;
       }
@@ -7978,7 +7958,12 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
                     if (redirect) { return true; }
                     auto ret = req.content_receiver(buf, n, off, len);
                     if (!ret) { error = Error::Canceled; }
-                    return ret;
+                    // return ret;
+                    if (ret) {
+                      return true;
+                    } else {
+                      return false;
+                    }
                   })
             : static_cast<ContentReceiverWithProgress>(
                   [&](const char *buf, size_t n, uint64_t /*off*/,
@@ -7994,7 +7979,12 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
       if (!req.progress || redirect) { return true; }
       auto ret = req.progress(current, total);
       if (!ret) { error = Error::Canceled; }
-      return ret;
+      // return ret;
+      if (ret) {
+        return true;
+      } else {
+        return false;
+      }
     };
 
     if (res.has_header("Content-Length")) {
@@ -9548,8 +9538,8 @@ SSLClient::verify_host_with_subject_alt_name(X509 *server_cert) const {
 
   auto type = GEN_DNS;
 
-  struct in6_addr addr6{};
-  struct in_addr addr{};
+  struct in6_addr addr6 {};
+  struct in_addr addr {};
   size_t addr_len = 0;
 
 #ifndef __MINGW32__
